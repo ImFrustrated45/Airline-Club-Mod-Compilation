@@ -10,6 +10,1370 @@
 // @updateURL    https://github.com/ImFrustrated45/Airline-Club-Mod-Compilation/blob/main/Cost_per_pax.user.js
 // @downloadURL  https://github.com/ImFrustrated45/Airline-Club-Mod-Compilation/blob/main/Cost_per_pax.user.js
 // ==/UserScript==
+var MIN_PLANES_TO_HIGHLIGHT = 500; // Changes which planes get the gold shadow/highlight on plane purchase table (not affected by filters in table header)
+
+var REMOVE_MOVING_BACKGROUND = true; // perf enhancement, less noisy -- !!! IF YOU ARE A PATREON MEMBER DISABLE THIS FOR YOUR CUSTOM BACKGROUNDS !!!
+var SOLID_BACKGROUND_COLOR = `rgb(83, 85, 113)`; // only matters if REMOVE_MOVING_BACKGROUND is true
+
+// Default filter values for plane purchase table header:
+var DEFAULT_MIN_PLANES_IN_CIRCULATION_FILTER = 450; // Changes default minimum number of planes in circulation to remove from plane purchase table
+var DEFAULT_MIN_FLIGHT_RANGE_FILTER = 1000;
+var DEFAULT_RUNWAY_LENGTH_FILTER = 3000;
+var DEFAULT_MIN_CAPACITY_FILTER = 0;
+
+var MAIN_PANEL_WIDTH = '62%'; // Percent of screen for all the main (left-side) tables with lists (flight/airplane/etc)
+var SIDE_PANEL_WIDTH = '38%'; // Percent of screen for all the right-side details (usually linked with whatever is selected in the main/left panel, e.g. flight details)
+
+// Plugin code starts here and goes to the end...
+// NOTE: there's a bit in the lines 800-830 where you can change the way airport and plane names are displayed on the flight list view, but you might want to change some of the column widths (around line 680) to keep the rows on one-line.
+// Feel free to leave a comment on the gist if you have any questions or requests: https://gist.github.com/aphix/fdeeefbc4bef1ec580d72639bbc05f2d
+
+function reportAjaxError(jqXHR, textStatus, errorThrown) {
+    console.error(JSON.stringify(jqXHR));
+    console.error("AJAX error: " + textStatus + ' : ' + errorThrown);
+    // throw errorThrown;
+}
+
+function _request(url, method = 'GET', data = undefined) {
+    return new Promise((resolve, reject) => {
+        $.ajax({
+            url,
+            type: method,
+            contentType: 'application/json; charset=utf-8',
+            data: data ? JSON.stringify(data) : data,
+            dataType: 'json',
+            success: resolve,
+            error: (...args) => {
+                reportAjaxError(...args);
+                reject(...args);
+            }
+        })
+    })
+}
+
+function getFactorPercent(consumption, subType) {
+    return (consumption.capacity[subType] > 0)
+        ? parseInt(consumption.soldSeats[subType] / consumption.capacity[subType] * 100)
+        : null;
+}
+
+function getLoadFactorsFor(consumption) {
+    var factor = {};
+    for (let key in consumption.capacity) {
+        factor[key] = getFactorPercent(consumption, key) || '-';
+    }
+    return factor;
+}
+
+function _seekSubVal(val, ...subKeys) {
+    if (subKeys.length === 0) {
+        return val;
+    }
+    return _seekSubVal(val[subKeys[0]], ...subKeys.slice(1));
+}
+
+function averageFromSubKey(array, ...subKeys) {
+    return array.map(obj => _seekSubVal(obj, ...subKeys)).reduce((sum, val) => sum += (val || 0), 0) / array.length;
+}
+
+function _populateDerivedFieldsOnLink(link) {
+    link.totalCapacity = link.capacity.economy + link.capacity.business + link.capacity.first
+    link.totalCapacityHistory = link.capacityHistory.economy + link.capacityHistory.business + link.capacityHistory.first
+    link.totalPassengers = link.passengers.economy + link.passengers.business + link.passengers.first
+    link.totalLoadFactor = link.totalCapacityHistory > 0 ? Math.round(link.totalPassengers / link.totalCapacityHistory * 100) : 0
+    var assignedModel
+    if (link.assignedAirplanes && link.assignedAirplanes.length > 0) {
+        assignedModel = link.assignedAirplanes[0].airplane.name
+    } else {
+        assignedModel = "-"
+    }
+    link.model = assignedModel //so this can be sorted
+
+    link.profitMarginPercent = link.revenue === 0
+        ? 0
+    : ((link.profit + link.revenue) / link.revenue) * 100;
+
+    link.profitMargin = link.profitMarginPercent > 100
+        ? link.profitMarginPercent - 100
+    : (100 - link.profitMarginPercent) * -1;
+
+    link.profitPerPax = link.totalPassengers === 0
+        ? 0
+    :link.profit / link.totalPassengers;
+
+    link.profitPerFlight = link.profit / link.frequency;
+    link.profitPerHour = link.profit / link.duration;
+    link.profitPerStaff = link.profit / link.staffInfo.staffBreakdown.total;
+}
+
+
+function getAirportText(city, airportCode) {
+	if (city) {
+		return city + " (" + airportCode + ")"
+	} else {
+		return airportCode
+	}
+}
+
+function plotHistory(linkConsumptions) {
+    plotLinkCharts(linkConsumptions)
+    $("#linkHistoryDetails").show()
+}
+
+function getShortModelName(airplaneName) {
+    var sections = airplaneName.trim().split(' ').slice(1);
+
+    return sections
+        .map(str => (str.includes('-')
+                     || str.length < 4
+                     || /^[A-Z0-9\-]+[a-z]{0,4}$/.test(str))
+             ? str
+             : str[0].toUpperCase())
+        .join(' ');
+}
+
+function getStyleFromTier(tier) {
+    const stylesFromGoodToBad = [
+        'color:#29FF66;',
+        'color:#5AB874;',
+        'color:inherit;',
+
+        'color:#FA8282;',
+        //'color:#FF3D3D;',
+        //'color:#B30E0E;text-shadow:0px 0px 2px #CCC;',
+
+        'color:#FF6969;',
+        'color:#FF3D3D;font-weight: bold;',
+        // 'color:#FF3D3D;text-decoration:underline',
+    ];
+
+
+    return stylesFromGoodToBad[tier];
+}
+
+function getTierFromPercent(val, min = 0, max = 100) {
+    var availableRange = max - min;
+    var ranges = [
+        .95,
+        .80,
+        .75,
+        .6,
+        .5
+    ].map(multiplier => (availableRange * multiplier) + min);
+
+    var tier;
+    if (val > ranges[0]) {
+        return 0;
+    } else if (val > ranges[1]) {
+        return 1;
+    } else if (val > ranges[2]) {
+        return 2;
+    } else if (val > ranges[3]) {
+        return 3;
+    } else if (val > ranges[4]) {
+        return 4;
+    }
+
+    return 5;
+}
+
+async function loadCompetitionForLink(airlineId, link) {
+    const linkConsumptions = await _request(`airports/${link.fromAirportId}/to/${link.toAirportId}`);
+
+    $("#linkCompetitons .data-row").remove()
+    $.each(linkConsumptions, function(index, linkConsumption) {
+        var row = $("<div class='table-row data-row'><div style='display: table-cell;'>" + linkConsumption.airlineName
+                + "</div><div style='display: table-cell;'>" + toLinkClassValueString(linkConsumption.price, "$")
+                + "</div><div style='display: table-cell; text-align: right;'>" + toLinkClassValueString(linkConsumption.capacity)
+                + "</div><div style='display: table-cell; text-align: right;'>" + linkConsumption.quality
+                + "</div><div style='display: table-cell; text-align: right;'>" + linkConsumption.frequency + "</div></div>")
+
+        if (linkConsumption.airlineId == airlineId) {
+            $("#linkCompetitons .table-header").after(row) //self is always on top
+        } else {
+            $("#linkCompetitons").append(row)
+        }
+
+    })
+
+    if ($("#linkCompetitons .data-row").length == 0) {
+        $("#linkCompetitons").append("<div class='table-row data-row'><div style='display: table-cell;'>-</div><div style='display: table-cell;'>-</div><div style='display: table-cell;'>-</div><div style='display: table-cell;'>-</div><div style='display: table-cell;'>-</div></div>")
+    }
+
+    $("#linkCompetitons").show()
+
+    assignAirlineColors(linkConsumptions, "airlineId")
+    plotPie(linkConsumptions, null, $("#linkCompetitionsPie"), "airlineName", "soldSeats")
+
+    return linkConsumptions;
+}
+
+function _isFullPax(link, key) {
+    return link.passengers[key] === link.capacity[key];
+}
+
+function _getPricesFor(link) {
+    var linkPrices = {};
+    for (var key in link.price) {
+        if (key === 'total') continue;
+
+        linkPrices[key] = link.price[key] - 5;
+        // linkPrices[key] = link.price[key] - (_isFullPax(link, key) ? 0 : 5);
+    }
+
+    return linkPrices;
+}
+
+async function _doAutomaticPriceUpdateFor(link) {
+    var priceUpdate = {
+        fromAirportId: link.fromAirportId,
+        toAirportId: link.toAirportId,
+        assignedDelegates: 0,
+        airplanes: {},
+        airlineId: link.assignedAirplanes[0].airplane.ownerId,
+        price: _getPricesFor(link),
+        model: link.assignedAirplanes[0].airplane.modelId,
+        rawQuality: link.rawQuality
+    }
+
+    for (var p of link.assignedAirplanes) {
+        if (!p.frequency) continue;
+
+        priceUpdate.airplanes[p.airplane.id] = p.frequency;
+    }
+
+    const updateResult = await _request(`/airlines/${priceUpdate.airlineId}/links`, 'PUT', priceUpdate);
+
+}
+
+//load history
+async function loadHistoryForLink(airlineId, linkId, cycleCount, link) {
+    const linkHistory = await _request(`airlines/${airlineId}/link-consumptions/${linkId}?cycleCount=${cycleCount}`);
+
+    if (jQuery.isEmptyObject(linkHistory)) {
+        $("#linkHistoryPrice").text("-")
+        $("#linkHistoryCapacity").text("-")
+        $("#linkLoadFactor").text("-")
+        $("#linkProfit").text("-")
+        $("#linkRevenue").text("-")
+        $("#linkFuelCost").text("-")
+        $("#linkCrewCost").text("-")
+        $("#linkAirportFees").text("-")
+        $("#linkDepreciation").text("-")
+        $("#linkCompensation").text("-")
+        $("#linkLoungeCost").text("-")
+        $("#linkServiceSupplies").text("-")
+        $("#linkMaintenance").text("-")
+        $("#linkOtherCosts").text("-")
+        $("#linkDelays").text("-")
+        $("#linkCancellations").text("-")
+
+        disableButton($("#linkDetails .button.viewLinkHistory"), "Passenger Map is not yet available for this route - please wait for the simulation (time estimation on top left of the screen).")
+        disableButton($("#linkDetails .button.viewLinkComposition"), "Passenger Survey is not yet available for this route - please wait for the simulation (time estimation on top left of the screen).")
+
+        plotHistory(linkHistory);
+        return;
+    }
+
+
+    if (!$("#linkAverageLoadFactor").length) {
+        $("#linkLoadFactor").parent().after(`<div class="table-row" style="color:#999">
+            <div class="label" style="color:#999"><h5>Avg. Load Factor:</h5></div>
+            <div class="value" id="linkAverageLoadFactor"></div>
+        </div>`)
+    }
+
+    if (!$("#linkAverageProfit").length) {
+        $("#linkProfit").parent().after(`<div class="table-row" style="color:#999">
+            <div class="label" style="color:#999"><h5>Avg. Profit:</h5></div>
+            <div class="value" id="linkAverageProfit"></div>
+        </div>`)
+    }
+
+    //if (!$("#doAutomaticPriceUpdate").length) {
+    //    $("#linkLoadFactor").parent().after(`<div class="table-row" style="color:#999">
+    //        <div class="button" id="doAutomaticPriceUpdate">Auto Manage</div>
+    //    </div>`)
+    //}
+
+    const averageLoadFactor = getLoadFactorsFor({
+        soldSeats: {
+            economy: averageFromSubKey(linkHistory, 'soldSeats', 'economy'),
+            business: averageFromSubKey(linkHistory, 'soldSeats', 'business'),
+            first: averageFromSubKey(linkHistory, 'soldSeats', 'first'),
+        },
+        capacity: {
+            economy: averageFromSubKey(linkHistory, 'capacity', 'economy'),
+            business: averageFromSubKey(linkHistory, 'capacity', 'business'),
+            first: averageFromSubKey(linkHistory, 'capacity', 'first'),
+        }
+    });
+
+    var latestLinkData = linkHistory[0]
+    $("#linkHistoryPrice").text(toLinkClassValueString(latestLinkData.price, "$"))
+    $("#linkHistoryCapacity").text(toLinkClassValueString(latestLinkData.capacity))
+
+    if (latestLinkData.totalLoadFactor !== 100) {
+        let originalLink = link;
+        //console.dir(originalLink);
+        $("#doAutomaticPriceUpdate").click(() => {
+            _doAutomaticPriceUpdateFor(originalLink);
+        });
+
+        $("#doAutomaticPriceUpdate").show();
+    } else {
+        $("#doAutomaticPriceUpdate").hide();
+    }
+
+    $("#linkLoadFactor").text(toLinkClassValueString(getLoadFactorsFor(latestLinkData), "", "%"))
+    $("#linkAverageLoadFactor").text(toLinkClassValueString(averageLoadFactor, "", "%"))
+
+    const dollarValuesByElementId = {
+        linkProfit: latestLinkData.profit,
+        linkAverageProfit: Math.round(averageFromSubKey(linkHistory, 'profit')),
+        linkRevenue: latestLinkData.revenue,
+        linkFuelCost: latestLinkData.fuelCost,
+        linkCrewCost: latestLinkData.crewCost,
+        linkAirportFees: latestLinkData.airportFees,
+        linkDepreciation: latestLinkData.depreciation,
+        linkCompensation: latestLinkData.delayCompensation,
+        linkLoungeCost: latestLinkData.loungeCost,
+        linkServiceSupplies: latestLinkData.inflightCost,
+        linkMaintenance: latestLinkData.maintenanceCost,
+    };
+
+    for (const elementId in dollarValuesByElementId) {
+        $('#'+elementId).text('$' + commaSeparateNumber(dollarValuesByElementId[elementId]));
+    }
+
+    if (latestLinkData.minorDelayCount == 0 && latestLinkData.majorDelayCount == 0) {
+        $("#linkDelays").removeClass("warning")
+        $("#linkDelays").text("-")
+    } else {
+        $("#linkDelays").addClass("warning")
+        $("#linkDelays").text(latestLinkData.minorDelayCount + " minor " + latestLinkData.majorDelayCount + " major")
+    }
+
+    if (latestLinkData.cancellationCount == 0) {
+        $("#linkCancellations").removeClass("warning")
+        $("#linkCancellations").text("-")
+    } else {
+        $("#linkCancellations").addClass("warning")
+        $("#linkCancellations").text(latestLinkData.cancellationCount)
+    }
+    enableButton($("#linkDetails .button.viewLinkHistory"))
+    enableButton($("#linkDetails .button.viewLinkComposition"))
+
+    plotHistory(linkHistory);
+
+    return linkHistory;
+}
+
+let lastPlotUnit;
+window._getPlotUnit = function _getPlotUnit() {
+    let checkedElem = $('#linkDetails fieldset .switch input:checked')[0];
+
+    if (!checkedElem && lastPlotUnit) {
+        return lastPlotUnit;
+    }
+
+    return lastPlotUnit = window.plotUnitEnum[checkedElem ? $(checkedElem).val().toUpperCase() : 'MONTH']
+}
+
+window.loadLink = async function loadLink(airlineId, linkId) {
+    const link = await _request(`airlines/${airlineId}/links/${linkId}`)
+
+    $("#linkFromAirport").attr("onclick", "showAirportDetails(" + link.fromAirportId + ")").html(getCountryFlagImg(link.fromCountryCode) + getAirportText(link.fromAirportCity, link.fromAirportCode))
+    //$("#linkFromAirportExpectedQuality").attr("onclick", "loadLinkExpectedQuality(" + link.fromAirportId + "," + link.toAirportId + "," + link.fromAirportId + ")")
+    $("#linkToAirport").attr("onclick", "showAirportDetails(" + link.toAirportId + ")").html(getCountryFlagImg(link.toCountryCode) + getAirportText(link.toAirportCity, link.toAirportCode))
+    //$("#linkToAirportExpectedQuality").attr("onclick", "loadLinkExpectedQuality(" + link.fromAirportId + "," + link.toAirportId + "," + link.toAirportId + ")")
+    $("#linkFlightCode").text(link.flightCode)
+    if (link.assignedAirplanes && link.assignedAirplanes.length > 0) {
+        $('#linkAirplaneModel').text(link.assignedAirplanes[0].airplane.name + "(" + link.assignedAirplanes.length + ")")
+    } else {
+        $('#linkAirplaneModel').text("-")
+    }
+    $("#linkCurrentPrice").text(toLinkClassValueString(link.price, "$"))
+    $("#linkDistance").text(link.distance + " km (" + link.flightType + ")")
+    $("#linkQuality").html(getGradeStarsImgs(Math.round(link.computedQuality / 10)) + link.computedQuality)
+    $("#linkCurrentCapacity").text(toLinkClassValueString(link.capacity))
+    if (link.future) {
+        $("#linkCurrentDetails .future .capacity").text(toLinkClassValueString(link.future.capacity))
+        $("#linkCurrentDetails .future").show()
+    } else {
+        $("#linkCurrentDetails .future").hide()
+    }
+    $("#linkCurrentDetails").show()
+
+    $("#linkToAirportId").val(link.toAirportId)
+    $("#linkFromAirportId").val(link.fromAirportId)
+
+    const plotUnit = _getPlotUnit();
+
+    // const plotUnit = $("#linkDetails #switchMonth").is(':checked')
+    //     ? window.plotUnitEnum.MONTH
+    //     : $("#linkDetails #switchQuarter").is(':checked')
+    //         ? window.plotUnitEnum.QUARTER
+    //         : window.plotUnitEnum.YEAR;
+
+    const cycleCount = plotUnit.maxWeek;
+
+    const [
+        linkCompetition,
+        linkHistory,
+    ] = await Promise.all([
+        loadCompetitionForLink(airlineId, link),
+        loadHistoryForLink(airlineId, linkId, cycleCount, link),
+    ])
+
+    return {
+        link,
+        linkCompetition,
+        linkHistory,
+    };
+}
+
+async function _updateLatestOilPriceInHeader() {
+    const oilPrices = await _request('oil-prices');
+    const latestPrice = oilPrices.slice(-1)[0].price;
+
+    if (!$('.topBarDetails .latestOilPriceShortCut').length) {
+        $('.topBarDetails .delegatesShortcut').after(`
+            <span style="margin: 0px 10px; padding: 0 5px"  title="Latest Oil Price" class="latestOilPriceShortCut clickable" onclick="showOilCanvas()">
+                <span class="latest-price label" style=""></span>
+            </span>
+        `);
+    }
+
+    const tierForPrice = 5 - getTierFromPercent(latestPrice, 40, 80);
+
+    if (tierForPrice < 2) {
+        $('.latestOilPriceShortCut')
+            .addClass('glow')
+            .addClass('button');
+    } else {
+        $('.latestOilPriceShortCut')
+            .removeClass('glow')
+            .removeClass('button');
+    }
+
+    $('.topBarDetails .latest-price')
+        .text('$'+commaSeparateNumber(latestPrice))
+        .attr({style: getStyleFromTier(tierForPrice)});
+
+    setTimeout(() => {
+        _updateLatestOilPriceInHeader();
+    }, Math.round(Math.max(durationTillNextTick / 2, 30000)));
+}
+
+function commaSeparateNumberForLinks(val) {
+    const over1k = val > 1000 || val < -1000;
+    const isNegative = (val < 0);
+
+    if (val !== 0) {
+        const withDecimal = Math.abs(over1k ? val / 1000 : val);
+        const remainderTenths = Math.round((withDecimal % 1) * 10) / 10;
+        val = Math.floor(withDecimal) + remainderTenths;
+
+        while (/(\d+)(\d{3})/.test(val.toString())) {
+            val = val.toString().replace(/(\d+)(\d{3})/, '$1'+','+'$2');
+        }
+    }
+
+    const valWithSuffix = over1k ? val + 'k' : val;
+
+    return isNegative ? '(' + valWithSuffix + ')' : valWithSuffix;
+}
+
+var _pluralize = (val, str) => `${val} ${str}${val === 1 ? '' : 's'}`
+var _twoDigit = (val) => padBefore(val, "0", 2)
+
+var totalmillisecPerWeek = 7 * 24 * 60 * 60 * 1000
+var refreshInterval = 1500 //every 5 second
+var incrementPerInterval = totalmillisecPerWeek / (40 * 60 * 1000) * refreshInterval //by default 40 minutes per week (was 15)
+var durationTillNextTick
+var hasTickEstimation = false
+var refreshIntervalTimer
+var days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+var _updateIntervalTimeout;
+
+
+function _refreshTicks() {
+    currentTime += incrementPerInterval
+    if (hasTickEstimation) {
+        durationTillNextTick -= refreshInterval
+    }
+    var date = new Date(currentTime)
+    //$(".currentTime").text("(" + days[date.getDay()] + ") " + padBefore(date.getMonth() + 1, "0", 2) + '/' + padBefore(date.getDate(), "0", 2) +  " " + padBefore(date.getHours(), "0", 2) + ":" +padBefore(date.getMinutes(), "0", 2))
+
+    var _updateTimeTextIfNeeded = () => null;
+    if (hasTickEstimation) {
+        var minutesLeft = Math.round(durationTillNextTick / 1000 / 60);
+        let unit = minutesLeft <= 0 ? 'second' : 'minute';
+        let count = unit === 'minute' ? minutesLeft : Math.round(minutesLeft / 60);
+        _updateTimeTextIfNeeded = () => $(".nextTickEstimation").text(_pluralize(count, unit));
+    }
+
+    requestAnimationFrame(() => {
+        $(".currentTime").text(`(${days[date.getDay()]}) ${_twoDigit(date.getMonth() + 1)}/${_twoDigit(date.getDate())} ${_twoDigit(date.getHours())}:${_twoDigit(date.getMinutes())}`)
+        _updateTimeTextIfNeeded();
+    });
+
+    _updateIntervalTimeout = setTimeout(() => _refreshTicks(), refreshInterval);
+}
+
+var _updateTime = window.updateTime = function updateTime(cycle, fraction, cycleDurationEstimation) {
+    console.log('internal updateTime');
+    console.dir({cycle, fraction, cycleDurationEstimation});
+
+    $(".currentTime").attr("title", "Current Cycle: " + cycle)
+    currrentCycle = currrentCycle = cycle
+    currentTime = (cycle + fraction) * totalmillisecPerWeek
+    if (_updateIntervalTimeout) {
+        //cancel old timer
+        clearTimeout(_updateIntervalTimeout)
+    }
+
+    if (cycleDurationEstimation > 0) { //update incrementPerInterval
+        incrementPerInterval = totalmillisecPerWeek / cycleDurationEstimation * refreshInterval
+        durationTillNextTick = cycleDurationEstimation * (1 - fraction)
+        hasTickEstimation = true
+    }
+
+    _refreshTicks();
+}
+
+window.onMessage = function onMessage(evt) { //right now the message is just the cycle #, so refresh the panels
+    console.log('onMessagehit');
+    var json = JSON.parse(evt.data)
+    if (json.ping) { //ok
+        console.debug("ping : " + json.ping)
+        return
+    }
+    console.log("websocket received message : " + evt.data)
+
+    if (json.messageType == "cycleInfo") { //update time
+        window.updateTime(json.cycle, json.fraction, json.cycleDurationEstimation)
+        //	} else if (json.messageType == "cycleStart") { //update time
+        //		updateTime(json.cycle, 0)
+    } else if (json.messageType == "cycleCompleted") {
+        if (selectedAirlineId) {
+            refreshPanels(selectedAirlineId)
+        }
+    } else if (json.messageType == "broadcastMessage") {
+        queuePrompt("broadcastMessagePopup", json.message)
+    } else if (json.messageType == "airlineMessage") {
+        queuePrompt("airlineMessagePopup", json.message)
+    } else if (json.messageType == "notice") {
+        queueNotice(json)
+    } else if (json.messageType == "tutorial") {
+        queueTutorialByJson(json)
+    } else if (json.messageType == "pendingAction") {
+        handlePendingActions(json.actions)
+    } else {
+        console.warn("unknown message type " + evt.data)
+    }
+}
+
+function launch(){
+
+    window.plotUnitEnum = {
+        "WEEK": {
+            "value": 4,
+            "maxWeek": 28,
+            "weeksPerMark": 1,
+            "maxMark": 28
+        },
+        "MONTH": {
+            "value": 1,
+            "maxWeek": 104,
+            "weeksPerMark": 4,
+            "maxMark": 28
+        },
+        "QUARTER": {
+            "value": 2,
+            "maxWeek": 168,
+            "weeksPerMark": 12,
+            "maxMark": 28
+        },
+        "YEAR": {
+            "value": 3,
+            "maxWeek": 300,
+            "weeksPerMark": 52,
+            "maxMark": 28
+        }
+    }
+
+    window.commaSeparateNumberForLinks = commaSeparateNumberForLinks;
+
+    var cachedTotalsById = window.cachedTotalsById = {};
+    window.cachedTotalsById = cachedTotalsById;
+
+	window.loadAirplaneModelStats = async function loadAirplaneModelStats(modelInfo, opts = {}) {
+	    var url
+	    var favoriteIcon = $("#airplaneModelDetail .favorite")
+	    var model = loadedModelsById[modelInfo.id]
+	    if (activeAirline) {
+	        url = "airlines/" + activeAirline.id + "/airplanes/model/" + model.id + "/stats",
+	        favoriteIcon.show()
+	    } else {
+	        url = "airplane-models/" + model.id + "/stats"
+	        favoriteIcon.hide()
+	    }
+
+        if (opts && opts.totalOnly && model.in_use  && model.in_use !== -1) {
+        	return;
+        }
+
+        if (opts && opts.totalOnly && cachedTotalsById[model.id]) {
+        	model.in_use = cachedTotalsById[model.id];
+        	return;
+        }
+
+        const stats = await _request(url);
+
+        if (opts && opts.totalOnly) {
+    		cachedTotalsById[model.id] = model.in_use = stats.total;
+        	return;
+        }
+
+    	updateTopOperatorsTable(stats)
+    	$('#airplaneCanvas .total').text(stats.total)
+
+    	cachedTotalsById[model.id] = model.in_use = stats.total;
+
+    	if (stats.favorite === undefined) {
+    		return;
+    	}
+
+	    favoriteIcon.off() //remove all listeners
+
+        if (stats.favorite.rejection) {
+            $("#setFavoriteModal").data("rejection", stats.favorite.rejection)
+        } else {
+            $("#setFavoriteModal").removeData("rejection")
+        }
+
+        if (modelInfo.isFavorite) {
+            favoriteIcon.attr("src", "assets/images/icons/heart.png")
+            $("#setFavoriteModal").data("rejection", "This is already the Favorite")
+        } else {
+            favoriteIcon.attr("src", "assets/images/icons/heart-empty.png")
+        }
+
+        $("#setFavoriteModal").data("model", model)
+	}
+
+    window.updateCustomLinkTableHeader = function updateCustomLinkTableHeader() {
+        if ($('#linksTableSortHeader').children().length === 16) {
+            return;
+        }
+
+        $('#linksCanvas .mainPanel').css({width: MAIN_PANEL_WIDTH});
+        $('#linksCanvas .sidePanel').css({width: SIDE_PANEL_WIDTH});
+
+        $('#canvas .mainPanel').css({width: MAIN_PANEL_WIDTH});
+        $('#canvas .sidePanel').css({width: SIDE_PANEL_WIDTH});
+
+        const widths = [
+            8,
+            8,
+            8,
+            6,
+            11,
+            4,
+            5,
+            5,
+            8,
+            7,
+            5,
+            5,
+            6,
+            6,
+            6,
+            2, //tiers, 1st
+        ];
+
+        const sum = widths.reduce((acc, val) => acc + val, 0);
+        if (sum !== 100) {
+            console.warn(`Column widths to not add up to 100: ${sum} (${widths.join(',')}) -- ${sum < 100 ? 'Remaining' : 'Over by'}: ${sum < 100 ? 100 - sum : sum - 100}%`)
+        }
+
+        $('#linksTableSortHeader').html(`
+            <div class="cell clickable" style="width: ${widths[15]}%" data-sort-property="tiersRank" data-sort-order="descending" onclick="toggleLinksTableSortOrder($(this))" title="Aggregated Rank">#</div>
+            <div class="cell clickable" style="width: ${widths[0]}%" data-sort-property="fromAirportCode" data-sort-order="descending" onclick="toggleLinksTableSortOrder($(this))">From</div>
+            <div class="cell clickable" style="width: 0%" data-sort-property="lastUpdate" data-sort-order="ascending" id="hiddenLinkSortBy"></div> <!--hidden column for last update (cannot be first otherwise the left round corner would not work -->
+            <div class="cell clickable" style="width: ${widths[1]}%" data-sort-property="toAirportCode" data-sort-order="descending" onclick="toggleLinksTableSortOrder($(this))">To</div>
+            <div class="cell clickable" style="width: ${widths[2]}%" data-sort-property="model" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">Model</div>
+            <div class="cell clickable" style="width: ${widths[3]}%" align="right" data-sort-property="distance" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">Dist.</div>
+            <div class="cell clickable" style="width: ${widths[4]}%" align="right" data-sort-property="totalCapacity" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">Capacity (Freq.)</div>
+            <div class="cell clickable" style="width: ${widths[5]}%" align="right" data-sort-property="totalPassengers" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">Pax</div>
+            <div class="cell clickable" style="width: ${widths[6]}%" align="right" data-sort-property="totalLoadFactor" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))" title="Load Factor">LF</div>
+            <div class="cell clickable" style="width: ${widths[7]}%" align="right" data-sort-property="satisfaction" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))" title="Satisfaction Factor">SF</div>
+            <div class="cell clickable" style="width: ${widths[8]}%" align="right" data-sort-property="revenue" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">Revenue</div>
+            <div class="cell clickable" style="width: ${widths[9]}%" align="right" data-sort-property="profit" data-sort-order="descending" onclick="toggleLinksTableSortOrder($(this))">Profit</div>
+            <div class="cell clickable" style="width: ${widths[10]}%" align="right" data-sort-property="profitMargin" title="Profit Margin" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">Gain</div>
+            <div class="cell clickable" style="width: ${widths[11]}%" align="right" data-sort-property="profitPerPax" title="Profit PerPax" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">$/🧍</div>
+            <div class="cell clickable" style="width: ${widths[12]}%" align="right" data-sort-property="profitPerFlight" title="Profit Per Flight" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">$/✈</div>
+            <div class="cell clickable" style="width: ${widths[13]}%" align="right" data-sort-property="profitPerHour" title="Profit Per Hour" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">$/⏲</div>
+            <div class="cell clickable" style="width: ${widths[14]}%" align="right" data-sort-property="profitPerStaff" title="Profit Per Staff" data-sort-order="ascending" onclick="toggleLinksTableSortOrder($(this))">$/👨‍💼</div>
+        `);
+
+        $('#linksTable .table-header').html(`
+            <div class="cell" style="width: ${widths[15]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[0]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[1]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[2]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[3]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[4]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[5]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[6]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[7]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[8]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[9]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[10]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[11]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[12]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[13]}%; border-bottom: none;"></div>
+            <div class="cell" style="width: ${widths[14]}%; border-bottom: none;"></div>
+        `);
+    }
+
+    window.loadLinksTable = async function loadLinksTable() {
+        const links = await _request(`airlines/${activeAirline.id}/links-details`);
+
+        await Promise.all(links.map(async link => {
+            link.staffInfo = await _getOvertimeAndStaffInfoForLink(link);
+        }))
+
+        _updateChartOptionsIfNeeded();
+        updateCustomLinkTableHeader();
+        updateLoadedLinks(links);
+
+        $.each(links, (key, link) => _populateDerivedFieldsOnLink(link));
+
+        var selectedSortHeader = $('#linksTableSortHeader .cell.selected')
+        updateLinksTable(selectedSortHeader.data('sort-property'), selectedSortHeader.data('sort-order'))
+    }
+
+    var colorKeyMaps = {};
+    window.updateLinksTable = function updateLinksTable(sortProperty, sortOrder) {
+        var linksTable = $("#linksCanvas #linksTable")
+        linksTable.children("div.table-row").remove()
+
+        loadedLinks = sortPreserveOrder(loadedLinks, sortProperty, sortOrder == "ascending")
+
+        function getKeyedStyleFromLink(link, keyName, ...args) {
+            if (!colorKeyMaps[keyName]) {
+                colorKeyMaps[keyName] = new WeakMap();
+            } else if (colorKeyMaps[keyName].has(link)) {
+                return colorKeyMaps[keyName].get(link);
+            }
+
+            var data = loadedLinks.map(l => l[keyName]);
+
+            var avg = data.reduce((sum, acc) => sum += acc, 0) / loadedLinks.length;
+            var max = Math.max(...data);
+            var min = Math.max(Math.min(...data), 0);
+
+            var tier = getTierFromPercent(link[keyName], args[0] !== undefined ? args[0] : min, args[1] || (avg * .618));
+            if (!link.tiers) {
+                link.tiers = {};
+            }
+
+            link.tiers[keyName] = tier;
+
+            var colorResult = getStyleFromTier(tier);
+
+            colorKeyMaps[keyName].set(link, colorResult);
+
+            return colorResult;
+        }
+
+        $.each(loadedLinks, function(index, link) {
+            var row = $("<div class='table-row clickable' onclick='selectLinkFromTable($(this), " + link.id + ")'></div>")
+
+            var srcAirportFull = getAirportText(link.fromAirportCity, link.fromAirportCode);
+            var destAirportFull = getAirportText(link.toAirportCity, link.toAirportCode);
+
+            //                 COMMENT one set or the other to test both:
+            // Truncated
+            //
+            row.append("<div class='cell' title='"+ srcAirportFull +"'>" + getCountryFlagImg(link.fromCountryCode) + ' ' + srcAirportFull.slice(-4, -1) + "</div>")
+            row.append("<div class='cell' title='"+ destAirportFull +"'>" + getCountryFlagImg(link.toCountryCode) + ' ' + destAirportFull.slice(-4, -1) + "</div>")
+            //
+            //    OR
+            //
+            // Original/Full airport names
+            //
+            //row.append("<div class='cell'>" + getCountryFlagImg(link.fromCountryCode) + ' ' + srcAirportFull + "</div>")
+            //row.append("<div class='cell'>" + getCountryFlagImg(link.toCountryCode) + ' ' + destAirportFull + "</div>")
+            //
+            //    OR
+            //
+            // Reversed, IATA/ICAO first w/ truncation
+            //
+            //row.append("<div class='cell' style='text-overflow: ellipsis;overflow: hidden;white-space: pre;' title='"+ srcAirportFull +"'>" + getCountryFlagImg(link.fromCountryCode) + ' ' + srcAirportFull.slice(-4, -1) + ' | ' + srcAirportFull.slice(0, -5) + "</div>")
+            //row.append("<div class='cell' style='text-overflow: ellipsis;overflow: hidden;white-space: pre;' title='"+ destAirportFull +"'>" + getCountryFlagImg(link.toCountryCode) + ' ' + destAirportFull.slice(-4, -1) + ' | ' + destAirportFull.slice(0, -5) + "</div>")
+            //
+
+            row.append("<div class='cell' style='text-overflow: ellipsis;overflow: hidden;white-space: pre;'>" + getShortModelName(link.model) + "</div>")
+            row.append("<div class='cell' align='right'>" + link.distance + "km</div>")
+            row.append("<div class='cell' align='right'>" + link.totalCapacity + " (" + link.frequency + ")</div>")
+            row.append("<div class='cell' align='right'>" + link.totalPassengers + "</div>")
+
+            // row.append("<div style='"+getKeyedStyleFromLink(link, 'totalLoadFactor', 0, 100)+"' class='cell' align='right'>" + link.totalLoadFactor + '%' + "</div>")
+            const lfBreakdown = {
+                economy: link.passengers.economy / link.capacity.economy,
+                business: link.passengers.business / link.capacity.business,
+                first: link.passengers.first / link.capacity.first,
+            };
+
+            lfBreakdownText = link.totalLoadFactor === 100
+                ? '100'
+                : [lfBreakdown.economy, lfBreakdown.business, lfBreakdown.first].map(v => v ? Math.floor(100 * v) : '-').join('/').replace(/(\/\-)+$/g, '')
+
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'totalLoadFactor', 0, 100)+"' class='cell' align='right'>" + lfBreakdownText + '%' + "</div>")
+
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'satisfaction', 0, 1)+"' class='cell' align='right'>" + Math.round(link.satisfaction * 100) + '%' + "</div>")
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'revenue')+"'  class='cell' align='right' title='$"+ commaSeparateNumber(link.revenue) +"'>" + '$' + commaSeparateNumberForLinks(link.revenue) + "</div>")
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'profit')+"'  class='cell' align='right' title='$"+ commaSeparateNumber(link.profit) +"'>" + '$' + commaSeparateNumberForLinks(link.profit) +"</div>")
+
+            //row.append("<div style='color:"+textColor+";' class='cell' align='right'>" + (link.profitMargin > 0 ? '+' : '') + Math.round(link.profitMargin) + "%</div>")
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'profitMarginPercent', 0, 136.5)+"' class='cell' align='right'>" + (link.profitMargin > 0 ? '+' : '') + Math.round(link.profitMargin) + "%</div>")
+
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'profitPerPax')+"' class='cell' align='right' title='$"+ commaSeparateNumber(link.profitPerPax) +"'>" + '$' + commaSeparateNumberForLinks(link.profitPerPax) + "</div>")
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'profitPerFlight')+"' class='cell' align='right' title='$"+ commaSeparateNumber(link.profitPerFlight) +"'>" + '$' + commaSeparateNumberForLinks(link.profitPerFlight) + "</div>")
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'profitPerHour')+"' class='cell' align='right' title='$"+ commaSeparateNumber(link.profitPerHour) +"'>" + '$' + commaSeparateNumberForLinks(link.profitPerHour) + "</div>")
+            row.append("<div style='"+getKeyedStyleFromLink(link, 'profitPerStaff')+"' class='cell' align='right' title='$"+ commaSeparateNumber(link.profitPerStaff) +"'>" + '$' + commaSeparateNumberForLinks(link.profitPerStaff) + "</div>")
+
+            if (selectedLink == link.id) {
+                row.addClass("selected")
+            }
+
+            const tiersRank = link.tiersRank = Object.keys(link.tiers).reduce((sum, key) => sum + link.tiers[key] + (key === 'profit' && link.tiers[key] === 0 ? -1 : 0), 0);
+
+            row.prepend("<div class='cell'>" + link.tiersRank + "</div>")
+
+            if (tiersRank < 2) {
+                row.css({'text-shadow': '0 0 3px gold'});
+            }
+
+            if (tiersRank > 27) {
+                row.css({'text-shadow': '0 0 3px red'});
+            }
+
+            linksTable.append(row)
+        });
+    }
+
+    window.refreshLinkDetails = async function refreshLinkDetails(linkId) {
+        const airlineId = activeAirline.id
+
+        $("#linkCompetitons .data-row").remove()
+        $("#actionLinkId").val(linkId)
+
+        // load link
+        const linkDetailsPromise = loadLink(airlineId, linkId); // not awaiting yet so we can kickoff the panel open animation while loading
+
+        setActiveDiv($("#linkDetails"))
+        hideActiveDiv($("#extendedPanel #airplaneModelDetails"))
+        $('#sidePanel').fadeIn(200);
+
+        const { link, linkCompetition, linkHistory } = await linkDetailsPromise; // link details loaded if needed for something later
+
+        console.log('HERE');
+        console.log('HERE');
+        console.dir({link, linkCompetition, linkHistory});
+    }
+
+    async function _getOvertimeAndStaffInfoForLink(link) {
+        const airplaneFrequencies = {};
+
+        for (const {airplane, frequency} of link.assignedAirplanes) {
+            airplaneFrequencies[airplane.id] = frequency;
+        }
+
+        // See "getLinkStaffingInfo" in main code to understand where this comes from:
+        const result = await _request(`airlines/${activeAirline.id}/link-overtime-compensation`, 'POST', {
+            fromAirportId : link.fromAirportId,
+            toAirportId : link.toAirportId,
+            airplanes : airplaneFrequencies,
+            airlineId: activeAirline.id,
+            price: {
+                economy: link.price.economy,
+                business: link.price.business,
+                first: link.price.first,
+            },
+            model: link.modelId,
+            rawQuality: link.rawQuality * 20,
+            assignedDelegates: 0,
+        })
+
+        return result;
+    }
+
+    function _updateChartOptionsIfNeeded() {
+        if ($('#linkDetails fieldset .switch #switchYear').length === 1) {
+            return
+        }
+
+        $('#linkDetails fieldset .switch').parent().html(`
+            <div class="switch" style="float: right; width: 160px;margin-right: 16px;">
+                <input type="radio" class="switch-input" name="view" value="week" id="switchWeek" checked="">
+                <label for="switchWeek" class="switch-label switch-label-off">Week</label>
+                <input type="radio" class="switch-input" name="view" value="month" id="switchMonth">
+                <label for="switchMonth" class="switch-label switch-label-on">Month</label>
+                <input type="radio" class="switch-input" name="view" value="quarter" id="switchQuarter">
+                <label for="switchQuarter" class="switch-label switch-label-on">Qtr</label>
+                <input type="radio" class="switch-input" name="view" value="year" id="switchYear">
+                <label for="switchYear" class="switch-label switch-label-on">Year</label>
+                <span class="switch-selection"></span>
+            </div>`);
+
+        $('#linkDetails fieldset').attr('onchange','refreshLinkCharts($(this))')
+
+         $(`<style>
+        /* Added by BetterAirlineClub plugin */
+        .switch-input#switchQuarter:checked + .switch-label-on ~ .switch-selection { left: 80px; }
+        .switch-input#switchYear:checked + .switch-label-on ~ .switch-selection { left: 120px; }
+        </style>`).appendTo('head');
+    }
+
+
+    window.refreshLinkCharts = async function refreshLinkCharts(parentEl) {
+        var _checkedElem = $('#linkDetails fieldset .switch input:checked')[0];
+
+        $('#linkDetails fieldset .switch input').each((index, childElem) => {
+            const same = childElem === _checkedElem;
+            $(childElem).attr('checked', same);
+        })
+
+        window.plotUnit = plotUnit = plotUnitEnum[$(_checkedElem).val().toUpperCase() || 'MONTH'];
+
+        var cycleCount = plotUnit.maxWeek
+        const actionLinkId = $("#actionLinkId").val();
+        const linkConsumptions = await _request(`airlines/${activeAirline.id}/link-consumptions/${actionLinkId}?cycleCount=${cycleCount}`);
+
+        plotLinkCharts(linkConsumptions, plotUnit)
+        $("#linkHistoryDetails").show();
+    }
+
+    window.plotLinkCharts = function plotLinkCharts(linkConsumptions, plotUnit = _getPlotUnit()) {
+        plotLinkProfit(linkConsumptions, $("#linkProfitChart"), plotUnit)
+        plotLinkConsumption(linkConsumptions, $("#linkRidershipChart"), $("#linkRevenueChart"), $("#linkPriceChart"), plotUnit)
+    }
+
+    window.plotLinkConsumption = function plotLinkConsumption(linkConsumptions, ridershipContainer, revenueContainer, priceContainer, plotUnit) {
+        ridershipContainer.children(':FusionCharts').each(function(i) { $(this)[0].dispose() });
+        revenueContainer.children(':FusionCharts').each(function(i) { $(this)[0].dispose() });
+        priceContainer.children(':FusionCharts').each(function(i) { $(this)[0].dispose() });
+
+        var emptySeatsData = []
+        var cancelledSeatsData = []
+        var soldSeatsData = {
+            economy : [],
+            business : [],
+            first : [],
+        };
+
+        var revenueByClass = {
+            economy : [],
+            business : [],
+            first : [],
+        };
+
+        var priceByClass = {
+            economy : [],
+            business : [],
+            first : [],
+        };
+
+        var category = []
+
+        if (plotUnit === undefined) {
+            plotUnit = plotUnitEnum.MONTH
+        }
+
+        var maxWeek = plotUnit.maxWeek
+        var weeksPerMark = plotUnit.weeksPerMark
+        var xLabel
+        switch (plotUnit.value) {
+          case plotUnitEnum.MONTH.value:
+            xLabel = 'Month'
+            break;
+          case plotUnitEnum.QUARTER.value:
+            xLabel = 'Quarter'
+            break;
+          case plotUnitEnum.YEAR.value:
+            xLabel = 'Year'
+            break;
+          case plotUnitEnum.WEEK.value:
+            xLabel = 'Week'
+            break;
+        }
+
+
+        if (!jQuery.isEmptyObject(linkConsumptions)) {
+            linkConsumptions = $(linkConsumptions).toArray().slice(0, maxWeek)
+            var hasCapacity = {} //check if there's any capacity for this link class at all
+            hasCapacity.economy = $.grep(linkConsumptions, (entry) => entry.capacity.economy > 0).length !== 0;
+            hasCapacity.business = $.grep(linkConsumptions, (entry) => entry.capacity.business > 0).length !== 0;
+            hasCapacity.first = $.grep(linkConsumptions, (entry) => entry.capacity.first > 0).length !== 0;
+
+            $.each(linkConsumptions.reverse(), function(key, linkConsumption) {
+                var capacity = linkConsumption.capacity.economy + linkConsumption.capacity.business + linkConsumption.capacity.first
+                var soldSeats = linkConsumption.soldSeats.economy + linkConsumption.soldSeats.business + linkConsumption.soldSeats.first
+                var cancelledSeats = linkConsumption.cancelledSeats.economy + linkConsumption.cancelledSeats.business + linkConsumption.cancelledSeats.first
+                emptySeatsData.push({ value : capacity - soldSeats - cancelledSeats  })
+                cancelledSeatsData.push({ value : cancelledSeats  })
+
+                soldSeatsData.economy.push({ value : linkConsumption.soldSeats.economy })
+                soldSeatsData.business.push({ value : linkConsumption.soldSeats.business })
+                soldSeatsData.first.push({ value : linkConsumption.soldSeats.first })
+
+                revenueByClass.economy.push({ value : linkConsumption.price.economy * linkConsumption.soldSeats.economy })
+                revenueByClass.business.push({ value : linkConsumption.price.business * linkConsumption.soldSeats.business })
+                revenueByClass.first.push({ value : linkConsumption.price.first * linkConsumption.soldSeats.first })
+
+                if (hasCapacity.economy) {
+                    priceByClass.economy.push({ value : linkConsumption.price.economy })
+                }
+                if (hasCapacity.business) {
+                    priceByClass.business.push({ value : linkConsumption.price.business })
+                }
+                if (hasCapacity.first) {
+                    priceByClass.first.push({ value : linkConsumption.price.first })
+                }
+
+                var mark = Math.floor(linkConsumption.cycle / weeksPerMark)
+                //var week = linkConsumption.cycle % 4 + 1
+                category.push({ label : mark.toString()})
+            })
+        }
+
+        var chartConfig = {
+            xAxisname: xLabel,
+            YAxisName: "Seats Consumption",
+            //sYAxisName: "Load Factor %",
+            sNumberSuffix: "%",
+            sYAxisMaxValue: "100",
+            transposeAxis: "1",
+            useroundedges: "1",
+            animation: "0",
+            showBorder: "0",
+            toolTipBorderRadius: "2",
+            toolTipPadding: "5",
+            plotBorderAlpha: "10",
+            usePlotGradientColor: "0",
+            paletteColors: "#007849,#0375b4,#ffce00,#D46A6A,#bbbbbb",
+            bgAlpha: "0",
+            showValues: "0",
+            canvasPadding: "0",
+            labelDisplay: "wrap",
+            labelStep: weeksPerMark
+        }
+
+        checkDarkTheme(chartConfig, true)
+
+        var ridershipChart = ridershipContainer.insertFusionCharts({
+            type: 'stackedarea2d',
+            width: '100%',
+            height: '100%',
+            dataFormat: 'json',
+            containerBackgroundOpacity: '0',
+            dataSource: {
+                "chart": chartConfig,
+                "categories": [{
+                    "category": category
+                }],
+                "dataset": [{
+                    seriesName: "Sold Seats (Economy)",
+                    data: soldSeatsData.economy
+                }, {
+                    seriesName: "Sold Seats (Business)",
+                    data: soldSeatsData.business
+                }, {
+                    seriesName: "Sold Seats (First)",
+                    data: soldSeatsData.first
+                }, {
+                    seriesName: "Cancelled Seats",
+                    data: cancelledSeatsData
+                }, {
+                    seriesName: "Empty Seats",
+                    data: emptySeatsData
+                }
+                //, {"seriesName": "Load Factor", "renderAs" : "line", "parentYAxis": "S", "data" : loadFactorData}
+                ]
+            }
+        })
+
+        chartConfig = {
+            xAxisname: xLabel,
+            YAxisName: "Revenue",
+            //sYAxisName: "Load Factor %",
+            sYAxisMaxValue: "100",
+            transposeAxis:"1",
+            useroundedges: "1",
+            numberPrefix: "$",
+            animation: "0",
+            showBorder: "0",
+            toolTipBorderRadius: "2",
+            toolTipPadding: "5",
+            plotBorderAlpha: "10",
+            usePlotGradientColor: "0",
+            paletteColors: "#007849,#0375b4,#ffce00",
+            bgAlpha:"0",
+            showValues:"0",
+            canvasPadding:"0",
+            labelDisplay:"wrap",
+            labelStep: weeksPerMark,
+        };
+
+        checkDarkTheme(chartConfig, true)
+
+        var revenueChart = revenueContainer.insertFusionCharts( {
+            type: 'stackedarea2d',
+            width: '100%',
+            height: '100%',
+            dataFormat: 'json',
+            containerBackgroundOpacity :'0',
+            dataSource: {
+                "chart": chartConfig,
+                "categories" : [{ "category" : category}],
+                "dataset": [{
+                    "seriesName": "Revenue (Economy)",
+                    "data": revenueByClass.economy
+                }, {
+                    "seriesName": "Revenue (Business)",
+                    "data": revenueByClass.business
+                }, {
+                    "seriesName": "Revenue (First)",
+                    "data": revenueByClass.first
+                }]
+            }
+        })
+
+        chartConfig = {
+            "xAxisname": xLabel,
+            "YAxisName": "Ticket Price",
+            //"sYAxisName": "Load Factor %",
+            "numberPrefix": "$",
+            "sYAxisMaxValue": "100",
+            "useroundedges": "1",
+            "transposeAxis": "1",
+            "animation": "0",
+            "showBorder": "0",
+            "drawAnchors": "0",
+            "toolTipBorderRadius": "2",
+            "toolTipPadding": "5",
+            "paletteColors": "#007849,#0375b4,#ffce00",
+            "bgAlpha": "0",
+            "showValues": "0",
+            "canvasPadding": "0",
+            "formatNumberScale": "0",
+            "labelDisplay": "wrap",
+            "labelStep": weeksPerMark
+        }
+
+        checkDarkTheme(chartConfig, true)
+
+        var priceChart = priceContainer.insertFusionCharts({
+            type: 'msline',
+            width: '100%',
+            height: '100%',
+            dataFormat: 'json',
+            containerBackgroundOpacity: '0',
+            dataSource: {
+                "chart": chartConfig,
+                "categories": [{
+                    "category": category
+                }],
+                "dataset": [{
+                    "seriesName": "Price (Economy)",
+                    "data": priceByClass.economy,
+                }, {
+                    "seriesName": "Price (Business)",
+                    "data": priceByClass.business,
+                }, {
+                    "seriesName": "Price (First)",
+                    "data": priceByClass.first,
+                }]
+            }
+        })
+    }
+
+    function plotLinkProfit(linkConsumptions, container, plotUnit) {
+        container.children(':FusionCharts').each((function(i) {
+              $(this)[0].dispose();
+        }))
+
+        var data = []
+        var category = []
+
+        var profitByMark = {}
+        var markOrder = []
+
+        if (plotUnit === undefined) {
+            plotUnit = plotUnitEnum.MONTH
+        }
+
+        var maxMark = plotUnit.maxMark
+        var xLabel
+        var yLabel
+        var weeksPerMark = plotUnit.weeksPerMark
+        switch (plotUnit.value) {
+            case plotUnitEnum.MONTH.value:
+                xLabel = 'Month'
+                yLabel = 'Monthly Profit'
+                break;
+            case plotUnitEnum.QUARTER.value:
+                xLabel = 'Quarter'
+                yLabel = 'Quarterly Profit'
+                break;
+            case plotUnitEnum.YEAR.value:
+                xLabel = 'Year'
+                yLabel = 'Yearly Profit'
+                break;
+            case plotUnitEnum.WEEK.value:
+                xLabel = 'Week'
+                yLabel = 'Weekly Profit'
+                break;
+        }
+
+        $.each(linkConsumptions, function(index, linkConsumption) {
+            //group in months first
+            var mark = Math.floor(linkConsumption.cycle / weeksPerMark)
+            if (profitByMark[mark] === undefined) {
+                profitByMark[mark] = linkConsumption.profit
+                markOrder.push(mark)
+            } else {
+                profitByMark[mark] += linkConsumption.profit
+            }
+        })
+
+
+        markOrder = markOrder.slice(0, maxMark)
+        $.each(markOrder.reverse(), function(key, mark) {
+            data.push({ value : profitByMark[mark] })
+            category.push({ label : mark.toString() })
+        })
+
+        var chartConfig = {
+                            "xAxisname": xLabel,
+                            "yAxisName": yLabel,
+                            "numberPrefix": "$",
+                            "useroundedges": "1",
+                            "animation": "0",
+                            "showBorder":"0",
+                            "showPlotBorder":"0",
+                            "toolTipBorderRadius": "2",
+                            "toolTipPadding": "5",
+                            "bgAlpha": "0",
+                            "showValues":"0"
+                            }
+
+        checkDarkTheme(chartConfig)
+
+        var chart = container.insertFusionCharts({
+            type: 'mscombi2d',
+            width: '100%',
+            height: '100%',
+            containerBackgroundOpacity :'0',
+            dataFormat: 'json',
+            dataSource: {
+                "chart": chartConfig,
+                "categories" : [{ "category" : category}],
+                "dataset" : [ {"data" : data}, {"renderas" : "Line", "data" : data} ]
+
+            }
+        })
+    }
+
+    function _addAllianceTooltipsToMap(airportMarkers) {
+        //now add extra listener for alliance airports
+        $.each(airportMarkers, function(key, marker) {
+            marker.addListener('mouseover', function(event) {
+                closeAlliancePopups()
+                var baseInfo = marker.baseInfo
+                $("#allianceBasePopup .city").html(getCountryFlagImg(baseInfo.countryCode) + "&nbsp;" + baseInfo.city)
+                $("#allianceBasePopup .airportName").text(baseInfo.airportName)
+                $("#allianceBasePopup .iata").html(baseInfo.airportCode)
+                $("#allianceBasePopup .airlineName").html(getAirlineLogoImg(baseInfo.airlineId) + "&nbsp;" + baseInfo.airlineName)
+                $("#allianceBasePopup .baseScale").html(baseInfo.scale)
+
+                var infoWindow = new google.maps.InfoWindow({ maxWidth : 1200});
+                var popup = $("#allianceBasePopup").clone()
+                popup.show()
+                infoWindow.setContent(popup[0])
+                //infoWindow.setPosition(event.latLng);
+                infoWindow.open(map, marker);
+                map.allianceBasePopup = infoWindow
+            })
+
+            marker.addListener('mouseout', function(event) {
+                closeAlliancePopups()
+            })
+        })
+
+
+        switchMap();
+        $("#worldMapCanvas").data("initCallback", function() { //if go back to world map, re-init the map
+            map.controls[google.maps.ControlPosition.TOP_CENTER].clear()
+            clearAllPaths()
+            updateAirportMarkers(activeAirline)
+            updateLinksInfo() //redraw all flight paths
+            closeAlliancePopups()
+        })
+
+        window.setTimeout(addExitButton , 1000); //delay otherwise it doesn't push to center
+    }
+
+    window.showAllianceMap = async function showAllianceMap() {
+        clearAllPaths()
+        deselectLink()
+
+        var alliancePaths = []
+
+
+        $('body .loadingSpinner').show()
+        const result = await _request(`alliances/${selectedAlliance.id}/details`);
+        $('body .loadingSpinner').hide()
+
+        $.each(result.links, function(index, link) {
+            alliancePaths.push(drawAllianceLink(link))
+        })
+        var allianceBases = []
+         $.each(result.members, function(index, airline) {
+            if (airline.role != "APPLICANT") {
+                $.merge(allianceBases, airline.bases)
+            }
+        })
+
+        window.lastAllianceInfo = {
+            allianceBases,
+            alliancePaths,
+            updateAirportBaseMarkers: () => {
+                var markers = updateAirportBaseMarkers(allianceBases, alliancePaths);
+                _addAllianceTooltipsToMap(markers);
+            }
+        };
+    }
+
+
+    _updateLatestOilPriceInHeader();
+};
+
+$(document).ready(() => setTimeout(() => launch(), 1000));
+
+
+// Begin Cost per PAX
+// Begin Cost per PAX
+// Begin Cost per PAX
+// Begin Cost per PAX
+
+
 console.log("Plane score script loading");
 
 function calcFlightTime(plane, distance){
@@ -34,61 +1398,110 @@ function calcFuelBurn(plane, distance){
     }
 }
 
+function _getPlaneCategoryFor(plane) {
+    switch (plane.airplaneType.toUpperCase()) {
+        case 'LIGHT':
+        case 'SMALL':
+            return 1;
+        case 'REGIONAL':
+            return 3;
+        case 'MEDIUM':
+            return 8;
+        case 'LARGE':
+            return 12;
+        case 'EXTRA LARGE':
+        case 'X_LARGE':
+            return 15;
+        case 'JUMBO':
+            return 18;
+        case 'SUPERSONIC':
+            return 12;
+    }
+    console.error(`BAC+CPP:Error:: Cannot get category for plane ${JSON.stringify(plane)}`)
+}
+
+let initialAirplaneModelStatsLoading = true;
+
 window.updateAirplaneModelTable = function(sortProperty, sortOrder) {
-    let distance = parseInt($("#fightRange").val());
-    let runway = parseInt($("#runway").val());
+    let distance = parseInt($("#flightRange").val(), 10);
+    let runway = parseInt($("#runway").val(), 10);
+    let min_capacity = parseInt($("#min_capacity").val(), 10);
+    let min_circulation = parseInt($("#min_circulation").val(), 10);
+
+    let owned_only = document.getElementById("owned_only").checked;
+    let use_flight_total =document.getElementById("use_flight_total").checked;
+
     for (let plane of loadedModelsOwnerInfo) {
+        plane.isOwned = ((plane.assignedAirplanes.length + plane.availableAirplanes.length + plane.constructingAirplanes.length) !== 0);
+
         if(plane.range < distance || plane.runwayRequirement > runway) {
             plane.cpp = -1;
             plane.max_rotation = -1;
-        } else {
-            var plane_category = -1;
-
-            switch (plane.airplaneType.toUpperCase()) {
-                case 'LIGHT':
-                case 'SMALL' :plane_category=1;break;
-                case 'REGIONAL' : plane_category=3;break;
-                case 'MEDIUM' : plane_category=8;break;
-                case 'LARGE' : plane_category=12;break;
-                case 'EXTRA LARGE' :
-                case 'X_LARGE' : plane_category=15;break;
-                case 'JUMBO' : plane_category=18;break;
-                case 'SUPERSONIC' : plane_category=12 ;break;
-            }
-
-            let flightDuration = calcFlightTime(plane, distance) ;
-            let price = plane.price;
-            if( plane.originalPrice){
-                price = plane.originalPrice;
-            }
-
-            let maxFlightMinutes = 4 * 24 * 60;
-            let frequency = Math.floor(maxFlightMinutes / ((flightDuration + plane.turnaroundTime)*2));
-
-            let flightTime = frequency * 2 * (flightDuration + plane.turnaroundTime);
-            let availableFlightMinutes = maxFlightMinutes - flightTime;
-            let utilisation = flightTime / (maxFlightMinutes - availableFlightMinutes);
-            let planeUtilisation = (maxFlightMinutes - availableFlightMinutes) / maxFlightMinutes;
-
-            let decayRate = 100 / (plane.lifespan * 3) * (1 + 2 * planeUtilisation);
-            let depreciationRate = Math.floor(price * (decayRate / 100) * utilisation);
-            let maintenance = plane.capacity * 100 * utilisation;
-
-            let airport_fee = (500 * plane_category + plane.capacity * 10) * 2;
-            let crew_cost = plane.capacity * (flightDuration / 60) * 12 ;
-            let inflight_cost = (20 + 8 * flightDuration / 60) * plane.capacity * 2;
-
-            plane.max_rotation = frequency;
-            plane.fbpf = calcFuelBurn(plane, distance);
-            plane.fbpp = plane.fbpf / plane.capacity;
-            plane.fbpw = plane.fbpf * plane.max_rotation;
-            plane.cpp = ((plane.fbpf * 0.08 + airport_fee + inflight_cost + crew_cost) * plane.max_rotation + depreciationRate + maintenance) / (plane.capacity * plane.max_rotation);
+            //continue;
         }
+        var plane_category = _getPlaneCategoryFor(plane);
+        let flightDuration = calcFlightTime(plane, distance) ;
+        let price = plane.price;
+        if( plane.originalPrice){
+            price = plane.originalPrice;
+        }
+
+        let maxFlightMinutes = 4 * 24 * 60;
+        let frequency = Math.floor(maxFlightMinutes / ((flightDuration + plane.turnaroundTime)*2));
+
+        let flightTime = frequency * 2 * (flightDuration + plane.turnaroundTime);
+        let availableFlightMinutes = maxFlightMinutes - flightTime;
+        let utilisation = flightTime / (maxFlightMinutes - availableFlightMinutes);
+        let planeUtilisation = (maxFlightMinutes - availableFlightMinutes) / maxFlightMinutes;
+
+        let decayRate = 100 / (plane.lifespan * 3) * (1 + 2 * planeUtilisation);
+        let depreciationRate = Math.floor(price * (decayRate / 100) * utilisation);
+        let maintenance = plane.capacity * 100 * utilisation;
+
+        let airport_fee = (500 * plane_category + plane.capacity * 10) * 2;
+        let crew_cost = plane.capacity * (flightDuration / 60) * 12 ;
+        let inflight_cost = (20 + 8 * flightDuration / 60) * plane.capacity * 2;
+
+        plane.max_rotation = frequency;
+        plane.fbpf = calcFuelBurn(plane, distance);
+        plane.fbpp = plane.fbpf / plane.capacity;
+        plane.fbpw = plane.fbpf * plane.max_rotation;
+        plane.fuel_total = ((plane.fbpf * 0.08 + airport_fee + inflight_cost + crew_cost) * plane.max_rotation + depreciationRate + maintenance);
+        plane.cpp = plane.fuel_total / (plane.capacity * plane.max_rotation);
+        plane.max_capacity = plane.capacity * plane.max_rotation;
+
+        plane.discountPercent = (plane.originalPrice) ? Math.round(100 - (plane.price / plane.originalPrice * 100)) : 0;
+
+        if (!plane.in_use) {
+            plane.in_use = -1;
+            loadAirplaneModelStats(plane, {totalOnly: true}).then(() => {
+                // This could probably be in a debounce but I'm cool with this for a final reload once stats are done.
+                if (!initialAirplaneModelStatsLoading) {
+                    return;
+                }
+                if (window.cachedTotalsById && Object.keys(window.cachedTotalsById).length === loadedModelsOwnerInfo.length) {
+                    initialAirplaneModelStatsLoading = false;
+                    updateAirplaneModelTable();
+                }
+            });
+        }
+
+        plane.shouldShow = ((plane.cpp === -1)
+           || (plane.max_capacity < min_capacity)
+           || (plane.range < distance)
+           || (plane.runwayRequirement > runway)
+           || (plane.in_use < min_circulation && !plane.isOwned)
+           || (owned_only && !plane.isOwned)) === false;
     }
 
     if (!sortProperty && !sortOrder) {
         var selectedSortHeader = $('#airplaneModelSortHeader .cell.selected')
         sortProperty = selectedSortHeader.data('sort-property')
+        if (sortProperty === 'capacity') {
+            sortProperty = 'max_capacity';
+        } else if (sortProperty === 'cpp' && use_flight_total) {
+            sortProperty = 'fuel_total';
+        }
         sortOrder = selectedSortHeader.data('sort-order')
     }
     //sort the list
@@ -97,18 +1510,24 @@ window.updateAirplaneModelTable = function(sortProperty, sortOrder) {
     var airplaneModelTable = $("#airplaneModelTable")
     airplaneModelTable.children("div.table-row").remove()
 
+    var cppValues = loadedModelsOwnerInfo.filter(l => l.shouldShow).map(l => l.cpp);
+    var cppMax = Math.max(...cppValues);
+    var cppMin = Math.max(Math.min(...cppValues), 0);
 
     $.each(loadedModelsOwnerInfo, function(index, modelOwnerInfo) {
-        if (modelOwnerInfo.cpp == -1) return;
-        var row = $("<div class='table-row clickable' data-model-id='" + modelOwnerInfo.id + "' onclick='selectAirplaneModel(loadedModelsById[" + modelOwnerInfo.id + "])'></div>")
+        if (!modelOwnerInfo.shouldShow) {
+            return;
+        }
+
+        var row = $("<div class='table-row clickable' style='"+ (modelOwnerInfo.isOwned ? "background: green;" : '') +"' data-model-id='" + modelOwnerInfo.id + "' onclick='selectAirplaneModel(loadedModelsById[" + modelOwnerInfo.id + "])'></div>")
         if (modelOwnerInfo.isFavorite) {
             row.append("<div class='cell'>" + modelOwnerInfo.name + "<img src='assets/images/icons/heart.png' height='10px'></div>")
         } else {
             row.append("<div class='cell'>" + modelOwnerInfo.name + "</div>")
         }
-        row.append("<div class='cell'>" + modelOwnerInfo.family + "</div>")
+        row.append("<div class='cell' style='text-overflow: ellipsis;text-wrap: nowrap;overflow: clip;' title='"+modelOwnerInfo.family+"'>" + modelOwnerInfo.family + "</div>")
         row.append("<div class='cell' align='right'>" + commaSeparateNumber(modelOwnerInfo.price) + "</div>")
-        row.append("<div class='cell' align='right'>" + modelOwnerInfo.capacity + " (" + (modelOwnerInfo.capacity * modelOwnerInfo.max_rotation)  + ")</div>")
+        row.append("<div class='cell' align='right'>" + modelOwnerInfo.capacity + " (" + (modelOwnerInfo.capacity * modelOwnerInfo.max_rotation) + ")</div>")
         row.append("<div class='cell' align='right'>" + modelOwnerInfo.range + " km</div>")
         row.append("<div class='cell' align='right'>" + modelOwnerInfo.fuelBurn + "</div>")
         row.append("<div class='cell' align='right'>" + modelOwnerInfo.lifespan / 52 + " yrs</div>")
@@ -116,7 +1535,20 @@ window.updateAirplaneModelTable = function(sortProperty, sortOrder) {
         row.append("<div class='cell' align='right'>" + modelOwnerInfo.runwayRequirement + " m</div>")
         row.append("<div class='cell' align='right'>" + modelOwnerInfo.assignedAirplanes.length + "/" + modelOwnerInfo.availableAirplanes.length + "/" + modelOwnerInfo.constructingAirplanes.length + "</div>")
         row.append("<div class='cell' align='right'>" + modelOwnerInfo.max_rotation + "</div>")
-        row.append("<div class='cell' align='right'>" + commaSeparateNumber(Math.round(modelOwnerInfo.cpp)) + "</div>")
+        row.append("<div class='cell' align='right' style='"+ getStyleFromTier(getTierFromPercent(-1*modelOwnerInfo.cpp, -1*cppMax, -1*cppMin)) +"' title='"+commaSeparateNumber(Math.round(modelOwnerInfo.fuel_total))+"/total ("+commaSeparateNumber(Math.round(modelOwnerInfo.cpp * modelOwnerInfo.capacity))+"/flight)'>" + commaSeparateNumber(Math.round(modelOwnerInfo.cpp)) + "</div>")
+
+        let discountTier;
+        if (modelOwnerInfo.discountPercent > 40) {
+            discountTier = 0;
+        } else if (modelOwnerInfo.discountPercent > 10) {
+            discountTier = 1;
+        } else if (modelOwnerInfo.discountPercent > 0) {
+            discountTier = 2;
+        } else {
+            discountTier = 3;
+        }
+        row.append("<div class='cell' align='right' style='"+ getStyleFromTier(discountTier) +"' >" + modelOwnerInfo.discountPercent + "</div>")
+        row.append("<div class='cell' style='"+ (modelOwnerInfo.in_use >= MIN_PLANES_TO_HIGHLIGHT ? "text-shadow: gold 0px 0px 3px;" : '') +"'  align='right'>" + modelOwnerInfo.in_use + "</div>")
 
 
         if (selectedModelId == modelOwnerInfo.id) {
@@ -127,22 +1559,92 @@ window.updateAirplaneModelTable = function(sortProperty, sortOrder) {
     });
 }
 
-$("#airplaneModelTable .table-header").append("<div class=\"cell\" style=\"width: 5%; border-bottom: none;\"></div>");
-$("#airplaneModelTable .table-header").append("<div class=\"cell\" style=\"width: 5%; border-bottom: none;\"></div>");
+const columnWidthPercents = [
+    17,
+    9,
+    8,
+    7,
+    7,
+    7,
+    7,
+    9,
+    7,
+    6,
+    3,
+    5,
+    4,
+    4
+];
+
+if (columnWidthPercents.reduce((sum, val) => sum += val, 0) !== 100) {
+    console.warn('Column widths do not equal 100%, widths:', columnWidthPercents);
+}
 
 
-$("#airplaneModelSortHeader").append("<div class=\"cell clickable\" style=\"width: 5%\" data-sort-property=\"max_rotation\" data-sort-order=\"ascending\" onclick=\"toggleAirplaneModelTableSortOrder($(this))\" align=\"right\">Max Freq.</div>");
-$("#airplaneModelSortHeader").append("<div class=\"cell clickable\" style=\"width: 5%\" data-sort-property=\"cpp\" data-sort-order=\"ascending\" onclick=\"toggleAirplaneModelTableSortOrder($(this))\" align=\"right\">Cost per PAX</div>");
+$("#airplaneModelSortHeader").append("<div class=\"cell clickable\" title=\"Max flight rotations (uses user-set distance above)\" data-sort-property=\"max_rotation\" data-sort-order=\"ascending\" onclick=\"toggleAirplaneModelTableSortOrder($(this))\" align=\"right\">⏲</div>");
+$("#airplaneModelSortHeader").append("<div class=\"cell clickable\" title=\"Cost Per Pax\" data-sort-property=\"cpp\" data-sort-order=\"ascending\" onclick=\"toggleAirplaneModelTableSortOrder($(this))\" align=\"right\">$/🧍</div>");
+$("#airplaneModelSortHeader").append("<div class=\"cell clickable\" title=\"Discount Percent (influcenced by demand & brand loyalties)\" data-sort-property=\"discountPercent\" data-sort-order=\"descending\" onclick=\"toggleAirplaneModelTableSortOrder($(this))\" align=\"right\">%🔽</div>");
+$("#airplaneModelSortHeader").append("<div class=\"cell clickable\" title=\"Total number in circulation (all players, game wide)\" data-sort-property=\"in_use\" data-sort-order=\"ascending\" onclick=\"toggleAirplaneModelTableSortOrder($(this))\" align=\"right\">#✈</div>");
 
-$("#airplaneCanvas .mainPanel .section .table .table-header:first").append("<div>Distance : <input type=\"text\" id=\"fightRange\" value=\"1000\"/><br>Runway length : <input type=\"text\" id=\"runway\" value=\"3000\"/></div>");
+const headerCells = document.querySelectorAll('#airplaneModelSortHeader .cell');
+for (var i = 0; i < headerCells.length; i++) {
+    headerCells[i].style = `width: ${columnWidthPercents[i]}%`
+}
 
-$("#fightRange").change(function(){window.updateAirplaneModelTable()});
-$("#runway").change(function(){window.updateAirplaneModelTable()});
+$('#airplaneModelTable .table-header').html(`
+    <div class="cell" style="width: ${columnWidthPercents[0]}%; border-bottom: none;"></div>
+    <div class="cell" style="width: ${columnWidthPercents[1]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[2]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[3]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[4]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[5]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[6]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[7]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[8]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[9]}%; border-bottom: none;"></div>
+    <div class="cell" style="width:  ${columnWidthPercents[10]}%; border-bottom: none;"></div><!-- New columns -->
+    <div class="cell" style="width:  ${columnWidthPercents[11]}%; border-bottom: none;"></div><!-- New columns -->
+    <div class="cell" style="width:  ${columnWidthPercents[12]}%; border-bottom: none;"></div><!-- New columns -->
+    <div class="cell" style="width:  ${columnWidthPercents[13]}%; border-bottom: none;"></div><!-- New columns -->
+`);
+
+$("#airplaneCanvas .mainPanel .section .table .table-header:first").append(`
+    <div class="cell detailsSelection">Distance: <input type="text" id="flightRange" value="${DEFAULT_MIN_FLIGHT_RANGE_FILTER}" /></div>
+    <div class="cell detailsSelection">Runway length: <input type="text" id="runway" value="${DEFAULT_RUNWAY_LENGTH_FILTER}" /></div>
+    <div class="cell detailsSelection">Min. Capacity: <input type="text" id="min_capacity" value="${DEFAULT_MIN_CAPACITY_FILTER}" /></div>
+    <div class="cell detailsSelection">Min. Circulation: <input type="text" id="min_circulation" value="${DEFAULT_MIN_PLANES_IN_CIRCULATION_FILTER}" /></div>
+    <div class="cell detailsSelection" style="min-width: 160px; text-align:right">
+        <label for="owned_only">Owned Only <input type="checkbox" id="owned_only" /></label>
+        <label for="use_flight_total">Flight Fuel Total <input type="checkbox" id="use_flight_total" /></label>
+    </div>
+`);
+
+
+$("#airplaneCanvas .mainPanel .section .detailsGroup .market.details").attr({style: 'width: 100%; height: calc(100% - 30px); display: block;'});
+
+$('[data-sort-property="totalOwned"]').text('Owned')
+$('[data-sort-property="totalOwned"]').attr({style: 'width: 6%;'});
+
+
+var newDataFilterElements = [
+    '#flightRange',
+    '#runway',
+    '#min_capacity',
+    '#min_circulation',
+    '#owned_only',
+    '#use_flight_total',
+]
+
+for (var el of newDataFilterElements) {
+    $(el).change(function(){window.updateAirplaneModelTable()});
+}
 
 //* Link Cost Preview
 
 let _updatePlanLinkInfo = window.updatePlanLinkInfo;
 let _updateTotalValues = window.updateTotalValues;
+
+window.latestActiveLink = null;
 
 let activeLink;
 let idFrom = -1;
@@ -168,8 +1670,8 @@ window.updateTotalValues = function(){
 }
 
 window.updatePlanLinkInfo = function(linkInfo){
-    console.log(linkInfo);
-    activeLink = linkInfo;
+    //console.log(linkInfo);
+    window.latestActiveLink = activeLink = linkInfo;
 
     for (let model of activeLink.modelPlanLinkInfo){
         for (let airplane of model.airplanes){
@@ -206,26 +1708,14 @@ window.updateModelInfo = function(modelId) {
     }
     _modelId = modelId;
 
-
     let model = loadedModelsById[modelId];
     let linkModel = activeLink.modelPlanLinkInfo.find(plane => plane.modelId == modelId);
+
+    //console.log({loadedModelsById, model, linkModel})
     let serviceLevel = parseInt($("#planLinkServiceLevel").val());
     let frequency = 0;
 
-    let plane_category = 0;
-
-    switch (model.airplaneType.toUpperCase()) {
-        case 'LIGHT':
-        case 'SMALL' :plane_category=1;break;
-        case 'REGIONAL' : plane_category=3;break;
-        case 'MEDIUM' : plane_category=8;break;
-        case 'LARGE' : plane_category=12;break;
-        case 'EXTRA LARGE' :
-        case 'X_LARGE' : plane_category=15;break;
-        case 'JUMBO' : plane_category=18;break;
-        case 'SUPERSONIC' : plane_category=12 ;break;
-        default: console.error("CPP E1:updateAirplaneModelTable unknown airplane type: " + model.airplaneType);
-    }
+    let plane_category = _getPlaneCategoryFor(model);
 
     let baseSlotFee = 0;
 
@@ -368,66 +1858,73 @@ window.updateModelInfo = function(modelId) {
 
 $("#airplaneModelDetails #speed").parent().after(`
 <div class="table-row">
- <div class="label">&#8205;</div>
+    <div class="label">&#8205;</div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>--  Costs  --</h5>
- </div>
+    <div class="label">
+        <h5>--  Costs  --</h5>
+    </div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>Fuel cost:</h5>
- </div>
- <div class="value" id="FCPF"></div>
+    <div class="label">
+        <h5>Fuel cost:</h5>
+    </div>
+    <div class="value" id="FCPF"></div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>Crew cost:</h5>
- </div>
- <div class="value" id="CCPF"></div>
+    <div class="label">
+        <h5>Crew cost:</h5>
+    </div>
+    <div class="value" id="CCPF"></div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>Airport fees:</h5>
- </div>
- <div class="value" id="AFPF"></div>
+    <div class="label">
+        <h5>Airport fees:</h5>
+    </div>
+    <div class="value" id="AFPF"></div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>Depreciation (wip):</h5>
- </div>
- <div class="value" id="depreciation"></div>
+    <div class="label">
+        <h5>Depreciation (wip):</h5>
+    </div>
+    <div class="value" id="depreciation"></div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>Service supplies:</h5>
- </div>
- <div class="value" id="SSPF"></div>
+    <div class="label">
+        <h5>Service supplies:</h5>
+    </div>
+    <div class="value" id="SSPF"></div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>Maintenance (wip):</h5>
- </div>
- <div class="value" id="maintenance"></div>
+    <div class="label">
+        <h5>Maintenance (wip):</h5>
+    </div>
+    <div class="value" id="maintenance"></div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>Cost per PAX:</h5>
- </div>
- <div class="value" id="cpp"></div>
+    <div class="label">
+        <h5>Cost per PAX:</h5>
+    </div>
+    <div class="value" id="cpp"></div>
 </div>
 <div class="table-row">
- <div class="label">
-  <h5>Cost per staff:</h5>
- </div>
- <div class="value" id="cps"></div>
+    <div class="label">
+        <h5>Cost per staff:</h5>
+    </div>
+    <div class="value" id="cps"></div>
 </div>
 <div class="table-row">
- <div class="label">&#8205;</div>
+    <div class="label">&#8205;</div>
 </div>`);
 
-console.log("Plane score script loaded");
+if (REMOVE_MOVING_BACKGROUND === true) {
+    setTimeout(() => {
+        $('body').attr({style:`background: ${SOLID_BACKGROUND_COLOR};background-color: ${SOLID_BACKGROUND_COLOR};background-image: none;`});
+    },1500);
+}
+
+console.log("BetterAirlineClub + Cost per PAX scripts loaded");
+
 
 
 
